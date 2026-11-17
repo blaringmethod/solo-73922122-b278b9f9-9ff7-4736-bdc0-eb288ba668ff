@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import os
 import socket
@@ -163,6 +164,23 @@ def main() -> None:
         check("历史 Parquet 未被改写",
               old_path.read_bytes() == before_bytes and old_path.stat().st_mtime_ns == before_mtime)
 
+        # 4b. 原件留存：网页显示摘要、下载逐字节一致、改列不改原件
+        source_dl = httpx.get(f"{A}/api/batches/{old['id']}/source")
+        old_source_path = data_dir / "source" / old["source_file_name"]
+        check("原件已同时落盘", old["has_source"] is True and old_source_path.is_file(),
+              old.get("source_file_name"))
+        check("原件下载 SHA-256 与登记一致",
+              source_dl.status_code == 200
+              and hashlib.sha256(source_dl.content).hexdigest() == old["source_sha256"],
+              old["source_sha256"])
+        old_page = httpx.get(f"{B}/batches/{old['id']}")
+        check("批次页显示原件 SHA-256", old_page.status_code == 200 and old["source_sha256"] in old_page.text)
+        index_page = httpx.get(f"{B}/")
+        check("首页批次列表显示原件摘要", old["source_sha256"] in index_page.text)
+
+        # 4c. 删除列后再从 B 下载原件，字节不得变化
+        source_before = old_source_path.read_bytes()
+
         # 5. 删除后同名新增：不串值
         v = httpx.get(f"{A}/api/schema").json()["schema_version"]
         r = httpx.request("DELETE", f"{A}/api/fields/{fields['temp_c']}", json={"schema_version": v})
@@ -189,6 +207,11 @@ def main() -> None:
         new_view = httpx.get(f"{A}/api/batches/{new.json()['id']}").json()
         check("新批次读到新值", cell(new_view, 0, "temp_c") == "88")
         check("新批次其他列正确", cell(new_view, 0, "humidity") == "55")
+        after_rename_source = httpx.get(f"{B}/api/batches/{old['id']}/source")
+        check("改列后原件字节不变且摘要不变",
+              after_rename_source.status_code == 200
+              and after_rename_source.content == source_before
+              and hashlib.sha256(after_rename_source.content).hexdigest() == old["source_sha256"])
 
         # 6. 过期版本上传被整次拒绝且不落文件
         v = httpx.get(f"{A}/api/schema").json()["schema_version"]
@@ -202,7 +225,9 @@ def main() -> None:
         )
         check("旧结构上传被拒绝", stale.status_code == 409, stale.text[:120])
         files = list((data_dir / "parquet").glob("*.parquet"))
+        sources = list((data_dir / "source").glob("*.csv"))
         check("拒绝的上传未留下 Parquet", len(files) == 2, [p.name for p in files])
+        check("拒绝的上传未留下原件", len(sources) == 2, [p.name for p in sources])
 
         # 7. 下载与完整性
         csv_dl = httpx.get(f"{A}/api/batches/{new.json()['id']}?format=csv")
@@ -214,8 +239,23 @@ def main() -> None:
         check("下载当前列名 Parquet", pq_dl.status_code == 200 and len(pq_dl.content) > 100)
         integrity = httpx.get(f"{A}/api/integrity").json()
         check("双实例一致性自检", integrity["ok"] and integrity["batches"] == 2, integrity)
+        check("原件一致性无缺失 / 摘要一致",
+              integrity["missing_source_files"] == [] and integrity["source_hash_mismatches"] == [])
         page = httpx.get(f"{B}/")
         check("网页可打开展示过期提示", page.status_code == 200)
+
+        # 8. 原件损坏 => 拒绝下载，Parquet 照旧
+        broken = data_dir / "source" / old["source_file_name"]
+        broken.write_bytes(b"tampered")
+        refused = httpx.get(f"{B}/api/batches/{old['id']}/source")
+        check("原件摘要不符时拒绝下载", refused.status_code == 500
+              and refused.json()["error"] == "source_integrity_error", refused.text[:160])
+        still = httpx.get(f"{B}/api/batches/{old['id']}?format=csv")
+        check("原件损坏不影响 Parquet 取数", still.status_code == 200)
+        report = httpx.get(f"{A}/api/integrity").json()
+        check("自检定位原件摘要不符",
+              report["ok"] is False
+              and report["source_hash_mismatches"] == [old["source_file_name"]])
         print("\n全部端到端检查通过。")
     finally:
         for path in stops:

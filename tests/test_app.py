@@ -416,6 +416,269 @@ def test_registration_failure_removes_new_file(client: TestClient, settings: Set
 
 
 # ---------------------------------------------------------------------------
+# 原件留存
+# ---------------------------------------------------------------------------
+
+
+RAW_CSV = b"\xef\xbb\xbfstation_id,observed_at,temp_c\r\n54511,2026-01-01T00:00:00Z,7\r\n"
+
+
+def upload_raw(client: TestClient, name: str = "raw.csv") -> httpx.Response:
+    v = current(client)["schema"]["schema_version"]
+    return client.post(
+        "/api/batches",
+        data={"version": v},
+        files={"file": (name, RAW_CSV, "text/csv")},
+    )
+
+
+def test_upload_retains_exact_source_bytes_and_hash(client: TestClient, settings: Settings):
+    add(client, "temp_c")
+    resp = upload_raw(client, name="观测 2026.csv")
+    assert resp.status_code == 201, resp.text
+    batch = resp.json()
+
+    assert batch["has_source"] is True
+    assert batch["source_sha256"] == hashlib.sha256(RAW_CSV).hexdigest()
+    assert batch["source_size"] == len(RAW_CSV)
+    assert batch["source_file_name"] == f"{batch['id']}.csv"
+    stored = settings.source_dir / batch["source_file_name"]
+    assert stored.read_bytes() == RAW_CSV
+    assert (settings.parquet_dir / batch["file_name"]).is_file()
+
+    downloaded = client.get(f"/api/batches/{batch['id']}/source")
+    assert downloaded.status_code == 200
+    assert downloaded.content == RAW_CSV
+    assert downloaded.headers["x-source-sha256"] == batch["source_sha256"]
+    assert downloaded.headers["content-disposition"].endswith('.csv"')
+
+    web = client.get(f"/batches/{batch['id']}/download.source.csv")
+    assert web.status_code == 200 and web.content == RAW_CSV
+
+    page = client.get(f"/batches/{batch['id']}")
+    assert page.status_code == 200
+    assert batch["source_sha256"] in page.text
+    listing = client.get("/").text
+    assert batch["source_sha256"] in listing
+
+
+def test_source_bytes_unaffected_by_later_schema_changes(client: TestClient, settings: Settings):
+    add(client, "temp_c")
+    batch = upload_raw(client).json()
+    source_path = settings.source_dir / batch["source_file_name"]
+    before = file_digest(source_path)
+
+    field_id = current(client)["schema"]["fields"][0]["id"]
+    v = current(client)["schema"]["schema_version"]
+    assert client.patch(
+        f"/api/fields/{field_id}", json={"schema_version": v, "name": "temperature_c"}
+    ).status_code == 200
+
+    assert file_digest(source_path) == before
+    again = client.get(f"/api/batches/{batch['id']}/source")
+    assert again.content == RAW_CSV
+    assert hashlib.sha256(again.content).hexdigest() == batch["source_sha256"]
+    # 按当前结构的 CSV 下载会改名，但原件下载仍是上传字节
+    current_csv = client.get(f"/api/batches/{batch['id']}?format=csv").text
+    assert "temperature_c" in current_csv and current_csv.encode() != RAW_CSV
+
+
+def test_source_missing_rejected_but_parquet_ok(client: TestClient, settings: Settings):
+    add(client, "temp_c")
+    batch = upload_raw(client).json()
+    (settings.source_dir / batch["source_file_name"]).unlink()
+
+    resp = client.get(f"/api/batches/{batch['id']}/source")
+    assert resp.status_code == 500
+    assert resp.json()["error"] == "source_integrity_error"
+    assert "缺失" in resp.json()["detail"]
+
+    web = client.get(f"/batches/{batch['id']}/download.source.csv")
+    assert web.status_code == 500
+    assert "原件校验失败" in web.text
+
+    # Parquet 取数照旧
+    view = client.get(f"/api/batches/{batch['id']}")
+    assert view.status_code == 200 and view.json()["rows"][0][2] == "7"
+    csv_dl = client.get(f"/api/batches/{batch['id']}?format=csv")
+    assert csv_dl.status_code == 200
+
+    report = client.get("/api/integrity").json()
+    assert report["ok"] is False
+    assert report["missing_source_files"] == [batch["source_file_name"]]
+    assert report["missing_files"] == []
+    page = client.get(f"/batches/{batch['id']}")
+    assert page.status_code == 200 and "校验失败" in page.text
+
+
+def test_source_hash_mismatch_rejected(client: TestClient, settings: Settings):
+    add(client, "temp_c")
+    batch = upload_raw(client).json()
+    path = settings.source_dir / batch["source_file_name"]
+    path.write_bytes(b"station_id,observed_at,temp_c\n54511,2026-01-01T00:00:00Z,999\n")
+
+    resp = client.get(f"/api/batches/{batch['id']}/source")
+    assert resp.status_code == 500
+    assert resp.json()["error"] == "source_integrity_error"
+    assert "摘要不符" in resp.json()["detail"]
+
+    report = client.get("/api/integrity").json()
+    assert report["ok"] is False
+    assert report["source_hash_mismatches"] == [batch["source_file_name"]]
+
+
+def test_legacy_batch_without_source_is_explicit(client: TestClient, settings: Settings):
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    resp = client.post(
+        "/api/batches",
+        data={"version": v},
+        files={"file": ("a.csv", simple_csv(temp_c=1), "text/csv")},
+    )
+    batch = resp.json()
+    # 模拟启用原件留存之前的旧登记
+    conn = sqlite3.connect(settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE batches SET source_file_name = NULL, source_sha256 = NULL, "
+            "source_size = NULL WHERE id = ?",
+            (batch["id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    state_batch = current(client)["batches"][0]
+    assert state_batch["has_source"] is False
+    resp = client.get(f"/api/batches/{batch['id']}/source")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "source_missing"
+    assert "没有保存原始 CSV" in resp.json()["detail"]
+
+    page = client.get(f"/batches/{batch['id']}")
+    assert page.status_code == 200
+    assert "没有保存原始 CSV" in page.text
+    assert "旧批次无原件" in page.text
+    # 旧批次不影响一致性自检，Parquet 仍可读
+    assert client.get("/api/integrity").json()["ok"] is True
+    assert client.get(f"/api/batches/{batch['id']}").json()["rows"][0][2] == "1"
+
+
+def test_source_write_failure_leaves_no_registration(client: TestClient, settings: Settings, monkeypatch):
+    add(client, "temp_c")
+    good = upload_raw(client)
+    assert good.status_code == 201
+    before = current(client)["batches"]
+
+    real = lake._write_bytes_atomic
+
+    def boom(data: bytes, final_path: Path) -> str:
+        real(data, final_path)
+        raise OSError("no space for source")
+
+    monkeypatch.setattr(lake, "_write_bytes_atomic", boom)
+    try:
+        failed = upload_raw(client)
+    finally:
+        monkeypatch.setattr(lake, "_write_bytes_atomic", real)
+    assert failed.status_code == 500
+    assert current(client)["batches"] == before
+    assert len(list(settings.source_dir.glob("*.csv"))) == 1
+    assert len(list(settings.parquet_dir.glob("*.parquet"))) == 1
+
+
+def test_source_commit_failure_removes_both_files(client: TestClient, settings: Settings, monkeypatch):
+    add(client, "temp_c")
+
+    def fail(*args, **kwargs):
+        raise lake.StorageError("登记失败（模拟）")
+
+    monkeypatch.setattr(lake, "_commit_batch", fail)
+    try:
+        resp = upload_raw(client)
+    finally:
+        monkeypatch.setattr(lake, "_commit_batch", lake._commit_batch)
+    assert resp.status_code == 500
+    assert current(client)["batches"] == []
+    assert list(settings.source_dir.glob("*.csv")) == []
+    assert list(settings.parquet_dir.glob("*.parquet")) == []
+
+
+def test_stale_upload_after_conversion_leaves_no_source(client: TestClient, settings: Settings, monkeypatch):
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    target = current(client)["schema"]["fields"][0]["id"]
+
+    def change_structure() -> None:
+        lake.rename_field(settings, v, target, "temp_air")
+
+    monkeypatch.setattr(lake, "_before_commit_hook", change_structure)
+    try:
+        resp = client.post(
+            "/api/batches",
+            data={"version": v},
+            files={"file": ("a.csv", simple_csv(temp_c=5), "text/csv")},
+        )
+    finally:
+        monkeypatch.setattr(lake, "_before_commit_hook", None)
+    assert resp.status_code == 409
+    assert current(client)["batches"] == []
+    assert list(settings.source_dir.glob("*.csv")) == []
+    assert list(settings.parquet_dir.glob("*.parquet")) == []
+    assert list(settings.source_dir.glob(".*.lock")) == []
+    assert list(settings.parquet_dir.glob(".*.lock")) == []
+
+
+def test_restart_keeps_source_downloadable(settings: Settings):
+    app = create_app(settings)
+    with TestClient(app) as c:
+        add(c, "temp_c")
+        batch = upload_raw(c).json()
+    with TestClient(create_app(Settings(data_dir=settings.data_dir, instance_name="again"))) as c:
+        got = c.get(f"/api/batches/{batch['id']}/source")
+        assert got.status_code == 200 and got.content == RAW_CSV
+        assert c.get("/api/integrity").json()["ok"] is True
+        assert current(c)["batches"][0]["source_sha256"] == batch["source_sha256"]
+
+
+def test_legacy_database_is_migrated(tmp_path: Path):
+    data_dir = tmp_path / "legacy"
+    data_dir.mkdir()
+    conn = sqlite3.connect(data_dir / "lake.sqlite3")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE fields (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                status TEXT NOT NULL, created_version INTEGER NOT NULL,
+                deleted_version INTEGER, created_at TEXT NOT NULL, deleted_at TEXT
+            );
+            CREATE TABLE batches (
+                id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+                schema_version INTEGER NOT NULL, row_count INTEGER NOT NULL,
+                file_name TEXT NOT NULL UNIQUE, file_sha256 TEXT NOT NULL,
+                schema_json TEXT NOT NULL
+            );
+            INSERT INTO meta VALUES ('schema_version', '0');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    s = Settings(data_dir=data_dir)
+    lake.initialize(s)
+    with sqlite3.connect(data_dir / "lake.sqlite3") as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(batches)")}
+    assert {"source_file_name", "source_sha256", "source_size",
+            "source_original_name"} <= columns
+    add_resp = lake.add_field(s, 0, "temp_c")
+    batch = lake.upload_csv(s, add_resp.version, RAW_CSV, original_name="x.csv")
+    assert lake.get_source(s, batch.id).data == RAW_CSV
+
+
+# ---------------------------------------------------------------------------
 # 一致性 / 重启 / 完整性
 # ---------------------------------------------------------------------------
 
@@ -636,6 +899,42 @@ def dual_instances(tmp_path: Path):
                 proc.kill()
 
 
+def test_cleanup_removes_orphans_but_keeps_in_flight_uploads(settings: Settings):
+    add_schema = lake.add_field(settings, 0, "temp_c")
+    registered = lake.upload_csv(settings, add_schema.version, RAW_CSV)
+
+    old = time.time() - 7200
+    # 崩溃遗留：超过 1 小时的未登记 Parquet / 原件
+    orphan_pq = settings.parquet_dir / "orphan.parquet"
+    orphan_csv = settings.source_dir / "orphan.csv"
+    orphan_pq.write_bytes(b"junk")
+    orphan_csv.write_bytes(b"junk")
+    # 另一实例在途上传：文件已落盘但尚未登记，且带有新鲜的租约标记
+    in_flight_pq = settings.parquet_dir / "inflight.parquet"
+    in_flight_csv = settings.source_dir / "inflight.csv"
+    in_flight_pq.write_bytes(b"junk")
+    in_flight_csv.write_bytes(b"junk")
+    for path in (in_flight_pq, in_flight_csv):
+        os.utime(path, (old, old))
+        lake._lease_marker(path).write_text("99999 0\n", encoding="ascii")
+    for path in (orphan_pq, orphan_csv):
+        os.utime(path, (old, old))
+    stale_temp = settings.source_dir / ".x.csv.dead.tmp"
+    stale_temp.write_bytes(b"junk")
+    os.utime(stale_temp, (old, old))
+
+    lake._cleanup_stale_temps(settings)
+    lake._cleanup_orphan_files(settings)
+
+    assert not orphan_pq.exists() and not orphan_csv.exists()
+    assert not stale_temp.exists()
+    assert in_flight_pq.exists() and in_flight_csv.exists()
+    assert lake._lease_marker(in_flight_pq).exists()
+    assert (settings.source_dir / registered.source_file_name).is_file()
+    assert (settings.parquet_dir / registered.file_name).is_file()
+    assert lake.get_source(settings, registered.id).data == RAW_CSV
+
+
 def test_two_processes_share_state_and_reject_stale_writes(dual_instances):
     urls, data_dir = dual_instances
     a, b = urls
@@ -699,3 +998,67 @@ def test_two_processes_share_state_and_reject_stale_writes(dual_instances):
     assert stale.status_code == 409
     assert len(httpx.get(f"{b}/api/state").json()["batches"]) == 1
     assert len(list((data_dir / "parquet").glob("*.parquet"))) == 1
+
+
+def test_two_processes_concurrent_uploads_keep_both_files(dual_instances):
+    urls, data_dir = dual_instances
+    a, b = urls
+
+    assert httpx.post(
+        f"{a}/api/fields", json={"schema_version": 0, "name": "temp_c"}
+    ).status_code == 201
+
+    payloads = {
+        f"node{idx}": csv_text(
+            ["station_id", "observed_at", "temp_c"],
+            [[f"54{idx:03d}", "2026-01-01T00:00:00Z", str(idx)]],
+        )
+        for idx in range(4)
+    }
+    results: list[httpx.Response] = []
+    lock = threading.Lock()
+
+    def upload(url: str, idx: int) -> None:
+        raw = payloads[f"node{idx}"]
+        resp = httpx.post(
+            f"{url}/api/batches",
+            data={"version": 1},
+            files={"file": (f"u{idx}.csv", raw, "text/csv")},
+            timeout=60,
+        )
+        with lock:
+            results.append(resp)
+
+    threads = [
+        threading.Thread(target=upload, args=(a if i % 2 == 0 else b, i))
+        for i in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert [r.status_code for r in results] == [201] * 4, [r.text for r in results]
+
+    state_a = httpx.get(f"{a}/api/state").json()
+    state_b = httpx.get(f"{b}/api/state").json()
+    assert len(state_a["batches"]) == 4
+    assert state_a["batches"] == state_b["batches"]
+    reg = {x["id"]: x for x in state_a["batches"]}
+    # 每个新登记批次都同时拥有 Parquet 与原件，且没有临时文件 / 未登记残件
+    for batch in reg.values():
+        assert batch["has_source"] is True
+        assert (data_dir / "parquet" / batch["file_name"]).is_file()
+        assert (data_dir / "source" / batch["source_file_name"]).is_file()
+        raw = httpx.get(f"{a}/api/batches/{batch['id']}/source", timeout=30)
+        assert raw.status_code == 200
+        assert hashlib.sha256(raw.content).hexdigest() == batch["source_sha256"]
+    assert len(list((data_dir / "parquet").glob("*.parquet"))) == 4
+    assert len(list((data_dir / "source").glob("*.csv"))) == 4
+    assert list((data_dir / "parquet").glob(".*.tmp")) == []
+    assert list((data_dir / "source").glob(".*.tmp")) == []
+    for origin in (a, b):
+        report = httpx.get(f"{origin}/api/integrity").json()
+        assert report["ok"] is True
+        assert report["batches"] == 4
+        assert report["missing_source_files"] == []
+        assert report["source_hash_mismatches"] == []

@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -53,6 +54,8 @@ INT64_MAX = 2**63 - 1
 
 SCHEMA_VERSION_KEY = "schema_version"
 UPLOAD_METADATA_PREFIX = b"metlake."
+SOURCE_SUFFIX = ".csv"
+PARQUET_SUFFIX = ".parquet"
 
 
 class LakeError(Exception):
@@ -95,6 +98,20 @@ class BatchIntegrityError(LakeError):
     code = "integrity_error"
 
 
+class SourceNotFound(LakeError):
+    """批次没有登记原件（旧批次），或批次不存在。"""
+
+    status_code = 404
+    code = "source_missing"
+
+
+class SourceIntegrityError(LakeError):
+    """批次登记了原件，但文件缺失 / 摘要不符，拒绝下载。"""
+
+    status_code = 500
+    code = "source_integrity_error"
+
+
 # ---------------------------------------------------------------------------
 # 配置 / 数据库基础
 # ---------------------------------------------------------------------------
@@ -123,9 +140,16 @@ class Settings:
     def parquet_dir(self) -> Path:
         return self.data_dir / "parquet"
 
+    @property
+    def source_dir(self) -> Path:
+        """上传原始 CSV 的留存目录（与转换产物分开，便于独立核对）。"""
+
+        return self.data_dir / "source"
+
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
+        self.source_dir.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass(frozen=True)
@@ -161,10 +185,18 @@ class Batch:
     file_name: str
     file_sha256: str
     fields_at_upload: tuple[dict, ...]
+    source_file_name: str | None = None
+    source_sha256: str | None = None
+    source_size: int | None = None
+    source_original_name: str | None = None
 
     @property
     def short_id(self) -> str:
         return self.id[:8]
+
+    @property
+    def has_source(self) -> bool:
+        return self.source_file_name is not None and self.source_sha256 is not None
 
 
 @dataclass(frozen=True)
@@ -196,6 +228,18 @@ class IntegrityReport:
     hash_mismatches: tuple[str, ...]
     orphan_files: tuple[str, ...]
     temp_files: tuple[str, ...]
+    missing_source_files: tuple[str, ...] = ()
+    source_hash_mismatches: tuple[str, ...] = ()
+    orphan_source_files: tuple[str, ...] = ()
+    source_temp_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SourceView:
+    """原始上传 CSV；``data`` 必须与上传时逐字节一致。"""
+
+    batch: Batch
+    data: bytes
 
 
 # 仅测试使用：Parquet 已写完、数据库提交前的钩子。
@@ -221,6 +265,27 @@ def _connect(settings: Settings) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous = FULL")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _migrate_source_columns(conn: sqlite3.Connection) -> None:
+    """为旧库补上原件留存列；旧批次保持 NULL（明确视为“无原件”）。
+
+    两实例并发初始化时由 ``BEGIN IMMEDIATE`` 串行化，重复 ALTER 不会发生。
+    """
+
+    existing = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(batches)").fetchall()
+    }
+    additions = {
+        "source_file_name": "TEXT",
+        "source_sha256": "TEXT",
+        "source_size": "INTEGER",
+        "source_original_name": "TEXT",
+    }
+    for column, sql_type in additions.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE batches ADD COLUMN {column} {sql_type}")
 
 
 def initialize(settings: Settings) -> None:
@@ -286,10 +351,15 @@ def initialize(settings: Settings) -> None:
                     row_count INTEGER NOT NULL,
                     file_name TEXT NOT NULL UNIQUE,
                     file_sha256 TEXT NOT NULL,
-                    schema_json TEXT NOT NULL
+                    schema_json TEXT NOT NULL,
+                    source_file_name TEXT,
+                    source_sha256 TEXT,
+                    source_size INTEGER,
+                    source_original_name TEXT
                 )
                 """
             )
+            _migrate_source_columns(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_batches_created_at "
                 "ON batches(created_at DESC)"
@@ -362,11 +432,25 @@ def _read_transaction(settings: Settings) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+# 读路径使用 ``SELECT *``：尚未执行 initialize 迁移的旧库也能读，缺失的
+# 原件列由 _row_value 视为 NULL（明确当作“无原件”）。
+_BATCH_COLUMNS = "*"
+
+
+def _row_value(row: sqlite3.Row, key: str):
+    try:
+        return row[key]
+    except (IndexError, KeyError):  # 兼容尚未迁移的旧库（只读路径）
+        return None
+
+
 def _rows_to_batch(row: sqlite3.Row) -> Batch:
     try:
         fields = tuple(json.loads(row["schema_json"]))
     except (TypeError, ValueError):
         fields = ()
+    source_sha256 = _row_value(row, "source_sha256")
+    source_size = _row_value(row, "source_size")
     return Batch(
         id=row["id"],
         created_at=row["created_at"],
@@ -375,6 +459,10 @@ def _rows_to_batch(row: sqlite3.Row) -> Batch:
         file_name=row["file_name"],
         file_sha256=row["file_sha256"],
         fields_at_upload=fields,
+        source_file_name=_row_value(row, "source_file_name"),
+        source_sha256=str(source_sha256) if source_sha256 is not None else None,
+        source_size=int(source_size) if source_size is not None else None,
+        source_original_name=_row_value(row, "source_original_name"),
     )
 
 
@@ -412,8 +500,7 @@ def read_state(settings: Settings) -> LakeState:
         with _read_transaction(settings) as conn:
             schema = _query_schema(conn)
             rows = conn.execute(
-                "SELECT id, created_at, schema_version, row_count, file_name, "
-                "file_sha256, schema_json FROM batches "
+                f"SELECT {_BATCH_COLUMNS} FROM batches "
                 "ORDER BY created_at DESC, id DESC"
             ).fetchall()
             batches = tuple(_rows_to_batch(r) for r in rows)
@@ -778,6 +865,89 @@ def _safe_unlink(path: Path) -> None:
         log.exception("清理文件失败 %s", path)
 
 
+# 本进程正在上传、尚未登记的文件；清理逻辑绝不触碰它们。
+_in_flight_paths: set[Path] = set()
+_in_flight_lock = threading.Lock()
+
+
+@contextmanager
+def _in_flight(*paths: Path) -> Iterator[None]:
+    with _in_flight_lock:
+        _in_flight_paths.update(paths)
+    try:
+        yield
+    finally:
+        with _in_flight_lock:
+            _in_flight_paths.difference_update(paths)
+
+
+def _is_in_flight(path: Path, cutoff: float) -> bool:
+    """判断文件是否正被上传写入。
+
+    同进程内用内存集合判断；跨实例则看目标文件旁的租约标记：标记仍在且
+    未过期 => 另一实例正在写，清理逻辑不得触碰。崩溃遗留的过期标记会在
+    清理时一并移除。
+    """
+
+    if _is_local_in_flight(path):
+        return True
+    marker = _lease_marker(path)
+    try:
+        return marker.is_file() and marker.stat().st_mtime >= cutoff
+    except OSError:
+        return False
+
+
+def _is_local_in_flight(path: Path) -> bool:
+    with _in_flight_lock:
+        return path in _in_flight_paths
+
+
+def _lease_marker(path: Path) -> Path:
+    return path.with_name(f".{path.name}.lock")
+
+
+def _refresh_lease(path: Path) -> None:
+    try:
+        os.utime(_lease_marker(path), None)
+    except OSError:
+        pass  # 标记可能被清理；本进程内存集合仍然保护
+
+
+@contextmanager
+def _upload_lease(*paths: Path) -> Iterator[None]:
+    """为即将落盘的最终文件建立租约，跨进程标记“在途上传”。"""
+
+    markers = [_lease_marker(p) for p in paths]
+    created: list[Path] = []
+    try:
+        for marker in markers:
+            try:
+                marker.write_text(
+                    f"{os.getpid()} {time.time():.3f}\n", encoding="ascii"
+                )
+                created.append(marker)
+            except OSError:
+                log.warning("无法创建上传租约标记 %s", marker)
+        with _in_flight(*paths):
+            yield
+    finally:
+        for marker in created:
+            _safe_unlink(marker)
+
+
+def _file_mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _old_enough(path: Path, cutoff: float) -> bool:
+    mtime = _file_mtime(path)
+    return mtime is not None and mtime < cutoff
+
+
 def _cleanup_stale_temps(settings: Settings) -> None:
     """清理超过 1 小时的临时文件。
 
@@ -786,56 +956,112 @@ def _cleanup_stale_temps(settings: Settings) -> None:
     """
 
     cutoff = time.time() - 3600
-    try:
+    for directory in (settings.parquet_dir, settings.source_dir):
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            log.warning("扫描临时文件失败：%s", directory)
+            continue
         candidates = [
             p
-            for p in settings.parquet_dir.iterdir()
-            if p.suffix == ".tmp" and p.is_file() and p.stat().st_mtime < cutoff
+            for p in entries
+            if p.suffix == ".tmp" and p.is_file() and _old_enough(p, cutoff)
         ]
-    except OSError:
-        log.warning("扫描临时文件失败")
-        return
-    for path in candidates:
-        try:
-            path.unlink(missing_ok=True)
-            log.warning("清理陈旧临时文件：%s", path.name)
-        except OSError:
-            log.warning("无法清理临时文件 %s", path)
+        for path in candidates:
+            if _is_in_flight(path, cutoff):
+                continue
+            try:
+                path.unlink(missing_ok=True)
+                log.warning("清理陈旧临时文件：%s", path.name)
+            except OSError:
+                log.warning("无法清理临时文件 %s", path)
+        # 崩溃实例遗留的过期租约标记；仍然新鲜、属于本进程或本进程
+        # 正在上传的目标文件，都要保留。
+        for marker in entries:
+            if not marker.name.endswith(".lock") or not marker.is_file():
+                continue
+            target = directory / marker.name[1 : -len(".lock")]
+            try:
+                if not _old_enough(marker, cutoff) or _is_local_in_flight(target):
+                    continue
+                marker.unlink(missing_ok=True)
+            except OSError:
+                log.warning("无法清理过期上传租约 %s", marker)
 
 
 def _cleanup_orphan_files(settings: Settings) -> None:
-    """清理崩溃遗留的、未被任何批次登记的 Parquet。
+    """清理崩溃遗留的、未被任何批次登记的 Parquet 与原件 CSV。
 
-    只处理超过 1 小时的文件，避免误删另一实例正在转换 / 即将登记的新文件。
+    只处理超过 1 小时、且没有在途租约的文件。删除动作放在一个
+    ``BEGIN IMMEDIATE`` 写事务里：登记批次同样要拿写锁，因此“查登记表 ->
+    删除”之间不可能插入新的批次登记，不会误删刚提交或仍在途的上传。
     """
 
     cutoff = time.time() - 3600
-    try:
-        candidates = [
-            p
-            for p in settings.parquet_dir.glob("*.parquet")
-            if p.is_file() and p.stat().st_mtime < cutoff
-        ]
-    except OSError:
-        log.warning("扫描孤立 Parquet 失败")
-        return
+    scan_pairs = (
+        (settings.parquet_dir, PARQUET_SUFFIX, "file_name", "Parquet"),
+        (settings.source_dir, SOURCE_SUFFIX, "source_file_name", "原件 CSV"),
+    )
+    candidates: list[tuple[Path, str, str]] = []
+    for directory, suffix, attr, label in scan_pairs:
+        try:
+            found = list(directory.glob(f"*{suffix}"))
+        except OSError:
+            log.warning("扫描未登记 %s 失败", label)
+            continue
+        for path in found:
+            if not path.is_file() or not _old_enough(path, cutoff):
+                continue
+            if _is_in_flight(path, cutoff):
+                continue
+            candidates.append((path, attr, label))
     if not candidates:
         return
     try:
-        registered = {b.file_name for b in read_state(settings).batches}
-    except LakeError:
-        return
-    for path in candidates:
-        if path.name in registered:
-            continue
-        try:
-            # 再确认一次：另一实例可能刚登记该文件
-            if path.name in {b.file_name for b in read_state(settings).batches}:
-                continue
-            path.unlink(missing_ok=True)
-            log.warning("清理未登记的孤立 Parquet：%s", path.name)
-        except (OSError, LakeError):
-            log.warning("无法清理孤立 Parquet：%s", path.name)
+        with _write_transaction(settings) as conn:
+            rows = conn.execute(
+                "SELECT file_name, source_file_name FROM batches"
+            ).fetchall()
+            registered = {
+                "file_name": {r["file_name"] for r in rows},
+                "source_file_name": {
+                    r["source_file_name"]
+                    for r in rows
+                    if r["source_file_name"] is not None
+                },
+            }
+            for path, attr, label in candidates:
+                if path.name in registered[attr]:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    log.warning("无法清理孤立 %s：%s", label, path.name)
+                    continue
+                log.warning("清理未登记的孤立 %s：%s", label, path.name)
+    except (LakeError, sqlite3.Error):
+        log.warning("清理孤立文件时无法获取登记表，本轮跳过")
+
+
+def _write_bytes_atomic(data: bytes, final_path: Path) -> str:
+    """原件 CSV：临时文件 -> fsync -> 校验摘要 -> rename -> fsync 目录。
+
+    返回落盘文件的 sha256；调用方保证 ``data`` 就是上传时的原始字节。
+    """
+
+    tmp_path = final_path.with_name(f".{final_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp_path.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        digest = _sha256_file(tmp_path)
+        os.replace(tmp_path, final_path)
+        _fsync_dir(final_path.parent)
+        return digest
+    except BaseException:
+        _safe_unlink(tmp_path)
+        raise
 
 
 def _write_parquet_atomic(
@@ -862,11 +1088,31 @@ def _write_parquet_atomic(
 # ---------------------------------------------------------------------------
 
 
-def upload_csv(settings: Settings, expected_version: int, data: bytes) -> Batch:
+def _safe_original_name(raw: str | None, fallback: str) -> str:
+    """保留上传文件名用于展示；只取 basename，去掉控制字符，限制长度。"""
+
+    if not raw:
+        return fallback
+    name = str(raw).replace("\\", "/").split("/")[-1]
+    name = "".join(ch for ch in name if ord(ch) >= 32 and ord(ch) != 127).strip()
+    if not name:
+        return fallback
+    return name[:200]
+
+
+def upload_csv(
+    settings: Settings,
+    expected_version: int,
+    data: bytes,
+    original_name: str | None = None,
+) -> Batch:
     """解析并转换后，在最终提交前再次校验结构版本。
 
-    转换/写文件期间不持有数据库写锁，因此结构仍可被另一进程修改；提交时
-    若版本已变化，则批次绝不登记，刚写的 Parquet 也会被清理。
+    原件 CSV 与转换后的 Parquet 都先完整落盘（写入、fsync、rename），
+    只有两者都成功且结构版本仍是上传者所见版本时才登记批次。转换/写文件
+    期间不持有数据库写锁，因此结构仍可被另一进程修改；提交时若版本已变，
+    批次绝不登记，刚写的两份文件都会删除。原件的 SHA-256 由上传字节直接
+    计算，登记后不再随结构变化而改变。
     """
 
     schema = read_schema(settings)
@@ -878,44 +1124,75 @@ def upload_csv(settings: Settings, expected_version: int, data: bytes) -> Batch:
 
     batch_id = uuid.uuid4().hex
     created_at = _utc_now_iso()
-    file_name = f"{batch_id}.parquet"
+    file_name = f"{batch_id}{PARQUET_SUFFIX}"
+    source_file_name = f"{batch_id}{SOURCE_SUFFIX}"
     final_path = settings.parquet_dir / file_name
+    source_path = settings.source_dir / source_file_name
+    source_sha256 = hashlib.sha256(data).hexdigest()
     fields_at_upload = [
         {"id": f.id, "name": f.name, "ordinal": f.ordinal} for f in schema.active
     ]
     schema_json = json.dumps(fields_at_upload, ensure_ascii=False, separators=(",", ":"))
     metadata = {
-        UPLOAD_METADATA_PREFIX + b"format": b"1",
+        UPLOAD_METADATA_PREFIX + b"format": b"2",
         UPLOAD_METADATA_PREFIX + b"batch_id": batch_id.encode("ascii"),
         UPLOAD_METADATA_PREFIX + b"schema_version": str(schema.version).encode("ascii"),
         UPLOAD_METADATA_PREFIX + b"created_at": created_at.encode("ascii"),
         UPLOAD_METADATA_PREFIX + b"fields": schema_json.encode("utf-8"),
+        UPLOAD_METADATA_PREFIX + b"source_sha256": source_sha256.encode("ascii"),
+        UPLOAD_METADATA_PREFIX + b"source_size": str(len(data)).encode("ascii"),
     }
 
-    try:
-        file_sha256 = _write_parquet_atomic(table, final_path, metadata)
-    except OSError as exc:
-        raise StorageError("写入 Parquet 失败，批次未登记。") from exc
+    with _upload_lease(final_path, source_path):
+        try:
+            parquet_sha256 = _write_parquet_atomic(table, final_path, metadata)
+            _refresh_lease(final_path)
+            written_source_sha256 = _write_bytes_atomic(data, source_path)
+            _refresh_lease(source_path)
+        except BaseException as exc:
+            _safe_unlink(final_path)
+            _safe_unlink(source_path)
+            if isinstance(exc, (OSError, pa.ArrowException)):
+                raise StorageError("写入批次文件失败，批次未登记。") from exc
+            raise
+        if written_source_sha256 != source_sha256:
+            _safe_unlink(final_path)
+            _safe_unlink(source_path)
+            raise StorageError("原件摘要校验失败，批次未登记。")
 
-    try:
-        if _before_commit_hook is not None:
-            _before_commit_hook()
-        batch = _commit_batch(
-            settings=settings,
-            expected_version=expected_version,
-            batch_id=batch_id,
-            created_at=created_at,
-            row_count=len(parsed.stations),
-            file_name=file_name,
-            file_sha256=file_sha256,
-            schema_json=schema_json,
-            fields_at_upload=fields_at_upload,
-        )
-    except BaseException:
-        _safe_unlink(final_path)
-        raise
+        try:
+            if _before_commit_hook is not None:
+                _before_commit_hook()
+            # 提交前再次确认两份文件都在位，绝不让新批次只登记到一份文件。
+            if not final_path.is_file() or not source_path.is_file():
+                raise StorageError("批次文件在登记前丢失，批次未登记。")
+            batch = _commit_batch(
+                settings=settings,
+                expected_version=expected_version,
+                batch_id=batch_id,
+                created_at=created_at,
+                row_count=len(parsed.stations),
+                file_name=file_name,
+                file_sha256=parquet_sha256,
+                schema_json=schema_json,
+                fields_at_upload=fields_at_upload,
+                source_file_name=source_file_name,
+                source_sha256=source_sha256,
+                source_size=len(data),
+                source_original_name=_safe_original_name(
+                    original_name, f"batch-{batch_id[:8]}.csv"
+                ),
+            )
+        except BaseException:
+            _safe_unlink(final_path)
+            _safe_unlink(source_path)
+            raise
     log.info(
-        "batch %s committed rows=%s schema=v%s", batch_id, len(parsed.stations), schema.version
+        "batch %s committed rows=%s schema=v%s source=%s",
+        batch_id,
+        len(parsed.stations),
+        schema.version,
+        source_file_name,
     )
     return batch
 
@@ -931,13 +1208,19 @@ def _commit_batch(
     file_sha256: str,
     schema_json: str,
     fields_at_upload: Sequence[dict],
+    source_file_name: str | None = None,
+    source_sha256: str | None = None,
+    source_size: int | None = None,
+    source_original_name: str | None = None,
 ) -> Batch:
     try:
         with _write_transaction(settings) as conn:
             _check_expected_version(conn, expected_version)
             conn.execute(
                 "INSERT INTO batches(id, created_at, schema_version, row_count, "
-                "file_name, file_sha256, schema_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "file_name, file_sha256, schema_json, source_file_name, "
+                "source_sha256, source_size, source_original_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     batch_id,
                     created_at,
@@ -946,6 +1229,10 @@ def _commit_batch(
                     file_name,
                     file_sha256,
                     schema_json,
+                    source_file_name,
+                    source_sha256,
+                    source_size,
+                    source_original_name,
                 ),
             )
     except LakeError:
@@ -960,6 +1247,10 @@ def _commit_batch(
         file_name=file_name,
         file_sha256=file_sha256,
         fields_at_upload=tuple(fields_at_upload),
+        source_file_name=source_file_name,
+        source_sha256=source_sha256,
+        source_size=source_size,
+        source_original_name=source_original_name,
     )
 
 
@@ -970,8 +1261,7 @@ def get_batch(settings: Settings, batch_id: str) -> BatchView:
         with _read_transaction(settings) as conn:
             schema = _query_schema(conn)
             row = conn.execute(
-                "SELECT id, created_at, schema_version, row_count, file_name, "
-                "file_sha256, schema_json FROM batches WHERE id = ?",
+                f"SELECT {_BATCH_COLUMNS} FROM batches WHERE id = ?",
                 (batch_id,),
             ).fetchone()
     except sqlite3.Error as exc:
@@ -983,6 +1273,76 @@ def get_batch(settings: Settings, batch_id: str) -> BatchView:
     physical = _read_physical_table(settings, batch)
     current = _materialize_current_table(physical, schema)
     return BatchView(schema=schema, batch=batch, table=current)
+
+
+def get_source(settings: Settings, batch_id: str) -> SourceView:
+    """按登记摘要返回上传时的原始字节。
+
+    原件校验独立于 Parquet 视图：即使转换产物损坏，只要原件完整仍可核对；
+    反之原件缺失或摘要不符则拒绝下载并说明原因，绝不回退到重新生成的 CSV。
+    """
+
+    try:
+        with _read_transaction(settings) as conn:
+            row = conn.execute(
+                f"SELECT {_BATCH_COLUMNS} FROM batches WHERE id = ?",
+                (batch_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise StorageError("读取批次失败。") from exc
+    if row is None:
+        raise NotFound("批次不存在。")
+
+    batch = _rows_to_batch(row)
+    if not batch.has_source:
+        raise SourceNotFound(
+            f"批次 {batch.short_id} 是启用原件留存之前登记的旧批次，"
+            "没有保存原始 CSV，无法下载原件；Parquet 数据仍可正常查看和下载。"
+        )
+
+    path = settings.source_dir / str(batch.source_file_name)
+    if not path.is_file():
+        raise SourceIntegrityError(
+            f"批次 {batch.short_id} 登记的原件 {batch.source_file_name} 已缺失，"
+            "拒绝提供原件下载。可继续使用 Parquet 数据，或通过 /api/integrity 核对。"
+        )
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise SourceIntegrityError(
+            f"批次 {batch.short_id} 的原件无法读取，拒绝提供原件下载。"
+        ) from exc
+    digest = hashlib.sha256(data).hexdigest()
+    size_mismatch = batch.source_size is not None and len(data) != batch.source_size
+    if size_mismatch or digest != batch.source_sha256:
+        raise SourceIntegrityError(
+            f"批次 {batch.short_id} 的原件摘要不符：登记 "
+            f"{batch.source_size} 字节 / SHA-256 {batch.source_sha256}，实际 "
+            f"{len(data)} 字节 / SHA-256 {digest}。"
+            "文件可能被篡改或损坏，拒绝提供原件下载。"
+        )
+    return SourceView(batch=batch, data=data)
+
+
+def source_status(settings: Settings, batch: Batch) -> str:
+    """网页展示用的轻量原件状态：``ok`` / ``none`` / ``broken``。
+
+    只分块计算摘要，不把整个文件读进内存；不抛异常，保证 Parquet 页面可用。
+    """
+
+    if not batch.has_source:
+        return "none"
+    path = settings.source_dir / str(batch.source_file_name)
+    try:
+        if not path.is_file():
+            return "broken"
+        if batch.source_size is not None and path.stat().st_size != batch.source_size:
+            return "broken"
+        if batch.source_sha256 is not None and _sha256_file(path) != batch.source_sha256:
+            return "broken"
+    except OSError:
+        return "broken"
+    return "ok"
 
 
 def _read_physical_table(settings: Settings, batch: Batch) -> pa.Table:
@@ -1105,19 +1465,32 @@ def sample_csv(schema: Schema, rows: int = 5) -> bytes:
 def check_integrity(settings: Settings) -> IntegrityReport:
     state = read_state(settings)
     registered = {b.file_name for b in state.batches}
+    registered_sources = {
+        b.source_file_name for b in state.batches if b.source_file_name is not None
+    }
     missing: list[str] = []
     mismatched: list[str] = []
+    missing_sources: list[str] = []
+    mismatched_sources: list[str] = []
     try:
         disk_files = {
-            p.name for p in settings.parquet_dir.glob("*.parquet") if p.is_file()
+            p.name for p in settings.parquet_dir.glob(f"*{PARQUET_SUFFIX}") if p.is_file()
         }
         temp_files = sorted(
             p.name
             for p in settings.parquet_dir.iterdir()
             if p.suffix == ".tmp" and p.is_file()
         )
+        disk_sources = {
+            p.name for p in settings.source_dir.glob(f"*{SOURCE_SUFFIX}") if p.is_file()
+        }
+        source_temp_files = sorted(
+            p.name
+            for p in settings.source_dir.iterdir()
+            if p.suffix == ".tmp" and p.is_file()
+        )
     except OSError as exc:
-        raise StorageError("扫描 Parquet 目录失败。") from exc
+        raise StorageError("扫描数据文件目录失败。") from exc
 
     for batch in state.batches:
         path = settings.parquet_dir / batch.file_name
@@ -1130,21 +1503,60 @@ def check_integrity(settings: Settings) -> IntegrityReport:
         except OSError:
             missing.append(batch.file_name)
 
+    for batch in state.batches:
+        if batch.source_file_name is None:
+            continue  # 旧批次没有登记原件，属于已知状态，不算不一致
+        path = settings.source_dir / batch.source_file_name
+        if not path.is_file():
+            missing_sources.append(batch.source_file_name)
+            continue
+        try:
+            if batch.source_sha256 is not None and (
+                _sha256_file(path) != batch.source_sha256
+            ):
+                mismatched_sources.append(batch.source_file_name)
+            elif batch.source_size is not None and (
+                path.stat().st_size != batch.source_size
+            ):
+                mismatched_sources.append(batch.source_file_name)
+        except OSError:
+            missing_sources.append(batch.source_file_name)
+
     # 正在转换、尚未登记的新文件是正常瞬时状态；只把 60 秒以上的未登记文件
     # 视为孤立文件，避免并发上传时误报。
     orphan_cutoff = time.time() - 60
     orphans: list[str] = []
     for name in sorted(disk_files - registered):
+        path = settings.parquet_dir / name
         try:
-            if (settings.parquet_dir / name).stat().st_mtime < orphan_cutoff:
+            if path.stat().st_mtime < orphan_cutoff and not _is_in_flight(
+                path, orphan_cutoff
+            ):
                 orphans.append(name)
         except OSError:
             continue
+    orphan_sources: list[str] = []
+    for name in sorted(disk_sources - registered_sources):
+        path = settings.source_dir / name
+        try:
+            if path.stat().st_mtime < orphan_cutoff and not _is_in_flight(
+                path, orphan_cutoff
+            ):
+                orphan_sources.append(name)
+        except OSError:
+            continue
     return IntegrityReport(
-        ok=not missing and not mismatched,
+        ok=not missing
+        and not mismatched
+        and not missing_sources
+        and not mismatched_sources,
         batches=len(state.batches),
         missing_files=tuple(missing),
         hash_mismatches=tuple(mismatched),
         orphan_files=tuple(orphans),
         temp_files=tuple(temp_files),
+        missing_source_files=tuple(missing_sources),
+        source_hash_mismatches=tuple(mismatched_sources),
+        orphan_source_files=tuple(orphan_sources),
+        source_temp_files=tuple(source_temp_files),
     )

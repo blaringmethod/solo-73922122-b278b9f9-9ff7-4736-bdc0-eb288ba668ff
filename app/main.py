@@ -46,7 +46,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="气象观测数据湖",
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
     )
     app.state.settings = resolved
@@ -112,12 +112,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def batch_page(request: Request, batch_id: str):
         view = lake.get_batch(resolved, batch_id)
         columns, rows = lake.rows_as_display(view.table)
+        source_state = _source_state(resolved, view.batch)
         return _render(
             request,
             "batch.html",
             settings=resolved,
             schema=view.schema,
             batch=view.batch,
+            source_state=source_state,
             columns=columns,
             rows=rows,
             ack=view.schema.version,
@@ -165,10 +167,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file: UploadFile = File(...),
     ):
         data = await _read_upload(file)
-        batch = lake.upload_csv(resolved, version, data)
+        batch = lake.upload_csv(resolved, version, data, original_name=file.filename)
         return _redirect_with_message(
             request,
-            f"批次 {batch.short_id} 已入湖（{batch.row_count} 行，结构 v{batch.schema_version}）。",
+            f"批次 {batch.short_id} 已入湖（{batch.row_count} 行，结构 v{batch.schema_version}），"
+            "原始 CSV 已留存。",
             "ok",
             path=f"/batches/{batch.id}",
         )
@@ -193,6 +196,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = lake.parquet_bytes(view.table)
         return _download(
             payload, f"batch-{view.batch.short_id}.parquet", "application/vnd.apache.parquet"
+        )
+
+    @app.get("/batches/{batch_id}/download.source.csv")
+    def download_source(batch_id: str):
+        source = lake.get_source(resolved, batch_id)
+        name = source.batch.source_file_name or f"batch-{source.batch.short_id}.csv"
+        return _download(
+            source.data,
+            name,
+            "text/csv; charset=utf-8",
+            extra_headers={
+                "X-Source-SHA256": str(source.batch.source_sha256),
+                "X-Original-Name": _header_safe(source.batch.source_original_name),
+                # 原件是不可变的历史字节，允许客户端缓存
+                "Cache-Control": "private, max-age=86400",
+            },
         )
 
     # ------------------------------------------------------------------
@@ -253,7 +272,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file: UploadFile = File(...),
     ):
         data = await _read_upload(file)
-        batch = lake.upload_csv(resolved, version, data)
+        batch = lake.upload_csv(resolved, version, data, original_name=file.filename)
         return JSONResponse(_batch_payload(batch), status_code=201)
 
     @app.get("/api/batches/{batch_id}")
@@ -281,6 +300,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "rows": rows,
         }
 
+    @app.get("/api/batches/{batch_id}/source")
+    def api_source(batch_id: str):
+        source = lake.get_source(resolved, batch_id)
+        name = source.batch.source_file_name or f"batch-{source.batch.short_id}.csv"
+        return _download(
+            source.data,
+            name,
+            "text/csv; charset=utf-8",
+            extra_headers={
+                "X-Source-SHA256": str(source.batch.source_sha256),
+                "X-Original-Name": _header_safe(source.batch.source_original_name),
+                "Cache-Control": "private, max-age=86400",
+            },
+        )
+
     @app.get("/api/integrity")
     def api_integrity():
         report = lake.check_integrity(resolved)
@@ -291,6 +325,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "hash_mismatches": list(report.hash_mismatches),
             "orphan_files": list(report.orphan_files),
             "temp_files": list(report.temp_files),
+            "missing_source_files": list(report.missing_source_files),
+            "source_hash_mismatches": list(report.source_hash_mismatches),
+            "orphan_source_files": list(report.orphan_source_files),
+            "source_temp_files": list(report.source_temp_files),
         }
 
     return app
@@ -306,6 +344,20 @@ def _latest_version(settings: Settings) -> int | None:
         return lake.read_schema(settings).version
     except LakeError:
         return None
+
+
+def _header_safe(value: str | None) -> str:
+    """HTTP 头只能是 latin-1；非 ASCII 文件名转成百分号编码，保留可读性。"""
+
+    if not value:
+        return ""
+    return quote(value, safe="")[:400]
+
+
+def _source_state(settings: Settings, batch: lake.Batch) -> str:
+    """网页展示用的原件状态：ok / none / broken；不阻断 Parquet 页面。"""
+
+    return lake.source_status(settings, batch)
 
 
 def _safe_version(settings: Settings) -> int | None:
@@ -341,6 +393,8 @@ _ERROR_TITLES = {
     "not_found": "未找到",
     "storage_error": "存储错误",
     "integrity_error": "数据完整性错误",
+    "source_missing": "没有可下载的原件",
+    "source_integrity_error": "原件校验失败",
     "bad_request": "请求无效",
 }
 
@@ -355,12 +409,16 @@ def _redirect_with_message(
     return response
 
 
-def _download(payload: bytes, filename: str, media_type: str) -> Response:
-    return Response(
-        content=payload,
-        media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+def _download(
+    payload: bytes,
+    filename: str,
+    media_type: str,
+    extra_headers: dict[str, str] | None = None,
+) -> Response:
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if extra_headers:
+        headers.update(extra_headers)
+    return Response(content=payload, media_type=media_type, headers=headers)
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -426,6 +484,14 @@ def _batch_payload(batch: lake.Batch) -> dict:
         "row_count": batch.row_count,
         "file_name": batch.file_name,
         "file_sha256": batch.file_sha256,
+        "source_file_name": batch.source_file_name,
+        "source_sha256": batch.source_sha256,
+        "source_size": batch.source_size,
+        "source_original_name": batch.source_original_name,
+        "has_source": batch.has_source,
+        "source_download_url": (
+            f"/api/batches/{batch.id}/source" if batch.has_source else None
+        ),
         "fields_at_upload": list(batch.fields_at_upload),
     }
 

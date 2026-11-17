@@ -30,7 +30,7 @@
       <dt>上传时结构</dt><dd>v{{ batch.schema_version }}</dd>
       <dt>行数</dt><dd>{{ batch.row_count }}</dd>
       <dt>Parquet</dt><dd>{{ batch.file_name }}</dd>
-      <dt>SHA-256</dt><dd>{{ batch.file_sha256 }}</dd>
+      <dt>Parquet SHA-256</dt><dd>{{ batch.file_sha256 }}</dd>
       <dt>展示快照</dt><dd>v{{ ack }}</dd>
     </dl>
     <div class="downloads">
@@ -38,6 +38,47 @@
       <a href="/batches/{{ batch.id }}/download.parquet">下载当前列名 Parquet</a>
       <a href="/api/batches/{{ batch.id }}">JSON</a>
     </div>
+  </section>
+
+  <section class="panel">
+    <h2>
+      原件留存
+      {% if source_state == "ok" %}<span class="badge ok">已登记</span>
+      {% elif source_state == "none" %}<span class="badge gray">旧批次无原件</span>
+      {% else %}<span class="badge err">校验失败</span>{% endif %}
+    </h2>
+    {% if batch.has_source %}
+    <dl class="meta">
+      <dt>原件摘要 SHA-256</dt><dd>{{ batch.source_sha256 }}</dd>
+      <dt>原件大小</dt><dd>{{ batch.source_size }} 字节</dd>
+      <dt>原件文件</dt><dd>{{ batch.source_file_name }}</dd>
+      {% if batch.source_original_name %}
+      <dt>上传文件名</dt><dd>{{ batch.source_original_name }}</dd>
+      {% endif %}
+    </dl>
+    <div class="downloads">
+      {% if source_state == "ok" %}
+      <a href="/batches/{{ batch.id }}/download.source.csv">下载上传时的原始 CSV</a>
+      <a href="/api/batches/{{ batch.id }}/source">原件下载（API）</a>
+      {% endif %}
+    </div>
+    {% if source_state == "ok" %}
+    <div class="notice info">
+      原件为上传时的逐字节副本，下载内容与上方 SHA-256 一致；后续新增 / 改名 /
+      删除列都不会改变原件字节。
+    </div>
+    {% elif source_state == "broken" %}
+    <div class="notice">
+      原件文件缺失或摘要不符，已拒绝原件下载；上方 SHA-256 仍为登记值。
+      Parquet 取数不受影响，可通过 <a href="/api/integrity">一致性自检</a> 定位问题文件。
+    </div>
+    {% endif %}
+    {% else %}
+    <div class="notice">
+      本批登记于启用原件留存之前（或没有原件记录），<strong>没有保存原始 CSV</strong>，
+      因此无法提供原件下载。Parquet 数据仍可正常查看与下载。
+    </div>
+    {% endif %}
   </section>
 
   <section class="panel">

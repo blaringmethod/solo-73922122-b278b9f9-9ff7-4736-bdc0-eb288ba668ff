@@ -100,6 +100,7 @@
               <th>入湖时间 (UTC)</th>
               <th>行数</th>
               <th>上传时结构</th>
+              <th>原件 SHA-256</th>
               <th></th>
             </tr>
           </thead>
@@ -110,11 +111,21 @@
               <td class="num">{{ batch.created_at }}</td>
               <td class="num">{{ batch.row_count }}</td>
               <td class="muted num">v{{ batch.schema_version }}</td>
+              <td class="num">
+                {% if batch.source_sha256 %}
+                  <code class="sha" title="{{ batch.source_sha256 }}">{{ batch.source_sha256 }}</code>
+                {% else %}
+                  <span class="muted" title="该批登记于启用原件留存之前">无原件</span>
+                {% endif %}
+              </td>
               <td>
                 <div class="row-actions">
                   <a href="/batches/{{ batch.id }}">查看</a>
                   <a href="/batches/{{ batch.id }}/download.csv">CSV</a>
                   <a href="/batches/{{ batch.id }}/download.parquet">Parquet</a>
+                  {% if batch.source_sha256 %}
+                  <a href="/batches/{{ batch.id }}/download.source.csv">原件</a>
+                  {% endif %}
                 </div>
               </td>
             </tr>
@@ -133,6 +144,7 @@
         <p class="hint" style="margin-top:-6px">
           表头须含 <code>station_id</code>、<code>observed_at</code>，
           其余列名必须与当前 v{{ ack }} 的测量列一致；每批最多 1000 行。
+          原始 CSV 会与转换后的 Parquet 一起留存，供日后核对争议报文。
         </p>
         <form class="stack-form" method="post" action="/upload" enctype="multipart/form-data">
           <input type="hidden" name="version" value="{{ ack }}">
